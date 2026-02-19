@@ -1,4 +1,4 @@
-# ARISS - Aggregate Representative Internet Sentiment Score
+# ARISS - Aggregate Real-Time Internet Sentiment Score
 
 A comprehensive sentiment analysis system that tracks opinion across social media platforms (Reddit, YouTube, Twitter, etc.) and provides objective, weighted sentiment scores for any subject. 
 
