@@ -1,6 +1,6 @@
 # ARISS - Aggregate Representative Internet Sentiment Score
 
-A comprehensive sentiment analysis system that tracks public opinion across social media platforms (Reddit, YouTube, Twitter) and provides objective, weighted sentiment scores for any subject.
+A comprehensive sentiment analysis system that tracks opinion across social media platforms (Reddit, YouTube, Twitter, etc.) and provides objective, weighted sentiment scores for any subject. 
 
 ![ARISS Dashboard](https://via.placeholder.com/800x400?text=ARISS+Dashboard)
 
