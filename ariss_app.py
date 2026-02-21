@@ -79,8 +79,6 @@ if 'current_subject' not in st.session_state:
 
 def get_database():
     """Get database instance (creates new connection per thread)."""
-    # Don't store database in session_state to avoid threading issues
-    # Create fresh instance each time
     return ARISSDatabase()
 
 
@@ -126,6 +124,10 @@ def calculate_new_ariss(subject: str, category: str = None):
     # Progress tracking
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    # Fetch context for subject
+    status_text.text(f"🔍 Understanding context for '{subject}'...")
+    context = st.session_state.scorer._get_current_context(subject)
     
     # Reddit scraping
     reddit_id = os.getenv("REDDIT_CLIENT_ID")
@@ -175,40 +177,80 @@ def calculate_new_ariss(subject: str, category: str = None):
         st.error("No comments found. Try a different subject or check API credentials.")
         return None
     
-    # Analyze comments
-    status_text.text("🤖 Analyzing sentiment...")
-    sentiment_scores = []
+    # Analyze comments with context
+    status_text.text(f"🤖 Analyzing sentiment with context: {context[:100]}...")
+    sentiment_results = []
     
     analysis_progress = st.progress(0)
     for i, comment in enumerate(all_comments):
-        score = st.session_state.scorer.analyze_comment(comment, subject)
-        sentiment_scores.append(score)
+        result = st.session_state.scorer.analyze_comment_with_context(
+            comment, subject, context
+        )
+        sentiment_results.append(result)
         analysis_progress.progress((i + 1) / len(all_comments))
     
     # Calculate ARISS
-    ariss_result = st.session_state.scorer.calculate_ariss(sentiment_scores)
+    ariss_result = st.session_state.scorer.calculate_ariss(sentiment_results)
+    
+    # Save to database - adapt v3 SentimentResult to old format for compatibility
+    # Convert SentimentResults to dict-like objects with expected fields
+    class SentimentScoreAdapter:
+        def __init__(self, result):
+            self.comment_id = result.comment_id
+            self.text = result.text
+            self.source = result.source
+            self.timestamp = result.timestamp
+            self.textblob_score = 50.0  # v3 doesn't use these, provide defaults
+            self.vader_score = 50.0
+            self.claude_score = result.sentiment_score
+            self.bias_score = 50.0  # v3 tracks this differently
+            self.source_credibility = 65.0  # default
+            self.length_weight = 1.0
+            self.word_count = result.word_count
+            self.weighted_score = result.sentiment_score
+            self.upvotes = result.upvotes
+            self.author = result.author
+    
+    adapted_results = [SentimentScoreAdapter(r) for r in sentiment_results]
     
     # Save to database
     db.save_ariss_score(subject, ariss_result, category)
-    db.save_sentiment_scores(subject, sentiment_scores, category)
+    db.save_sentiment_scores(subject, adapted_results, category)
     
     progress_bar.empty()
     status_text.empty()
     analysis_progress.empty()
     
-    return ariss_result, sentiment_scores
+    return ariss_result, sentiment_results
 
 
 def display_score_gauge(score: float, label: str = "ARISS Score"):
-    """Display a gauge chart for the score."""
+    """Display a gauge chart for the score with properly centered number."""
     fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
+        mode="gauge+number",
         value=score,
         domain={'x': [0, 1], 'y': [0, 1]},
-        title={'text': label, 'font': {'size': 24}},
+        title={
+            'text': label, 
+            'font': {'size': 24},
+            'align': 'center'
+        },
+        number={
+            'font': {'size': 60},
+            'valueformat': '.0f',
+            'suffix': '',
+            'prefix': ''
+        },
         gauge={
-            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkgray"},
-            'bar': {'color': get_score_color(score)},
+            'axis': {
+                'range': [0, 100], 
+                'tickwidth': 1, 
+                'tickcolor': "darkgray",
+                'tickmode': 'linear',
+                'tick0': 0,
+                'dtick': 20
+            },
+            'bar': {'color': get_score_color(score), 'thickness': 0.75},
             'bgcolor': "white",
             'borderwidth': 2,
             'bordercolor': "gray",
@@ -229,7 +271,9 @@ def display_score_gauge(score: float, label: str = "ARISS Score"):
     
     fig.update_layout(
         height=300,
-        margin=dict(l=20, r=20, t=40, b=20)
+        margin=dict(l=20, r=20, t=60, b=20),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)'
     )
     
     return fig
@@ -254,24 +298,6 @@ def display_history_chart(df: pd.DataFrame):
         hovertemplate='<b>%{x|%Y-%m-%d %H:%M}</b><br>Score: %{y:.1f}<extra></extra>'
     ))
     
-    # Confidence band
-    if 'confidence' in df.columns:
-        # Use confidence as opacity/size indicator
-        fig.add_trace(go.Scatter(
-            x=df['timestamp'],
-            y=df['score'],
-            mode='markers',
-            name='Confidence',
-            marker=dict(
-                size=df['confidence'] / 5,  # Scale confidence to marker size
-                color=df['confidence'],
-                colorscale='Viridis',
-                showscale=True,
-                colorbar=dict(title="Confidence")
-            ),
-            hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Confidence: %{marker.color:.1f}%<extra></extra>'
-        ))
-    
     # Add neutral line
     fig.add_hline(y=50, line_dash="dash", line_color="gray", 
                   annotation_text="Neutral", annotation_position="right")
@@ -283,14 +309,7 @@ def display_history_chart(df: pd.DataFrame):
         yaxis=dict(range=[0, 100]),
         hovermode='x unified',
         height=400,
-        showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        )
+        showlegend=True
     )
     
     return fig
@@ -329,14 +348,22 @@ def main():
     <p style="text-align: center; font-size: 1.2rem; color: #666; margin-top: -1rem;">
     Aggregate Real-time Internet Sentiment Score
     </p>
+    <p style="text-align: center; font-size: 1.5rem; color: #667eea; font-weight: 600; margin-top: -0.5rem;">
+    What does the internet think?
+    </p>
     """, unsafe_allow_html=True)
+    
+    # Initialize analyzer
+    if not st.session_state.scorer:
+        st.error("⚠️ ANTHROPIC_API_KEY not found. Please set it in your .env file.")
+        st.stop()
+    
+    # Get database instance (before sidebar uses it)
+    db = get_database()
     
     # Sidebar
     with st.sidebar:
         st.header("🔍 Search")
-        
-        # Get database instance
-        db = get_database()
         
         # Search or new subject
         search_mode = st.radio(
@@ -404,28 +431,34 @@ def main():
         
         st.divider()
         
+        st.header("📋 About This Tool")
+        st.write("""
+        This tool helps you:
+        - 📄 Track real-time internet sentiment
+        - 🚨 Understand public opinion
+        - 💰 Monitor sentiment trends over time
+        - ✏️ Get context-aware analysis
+        - ⚖️ See distribution of opinions
+        """)
+        
+        st.divider()
+        
         st.header("ℹ️ About ARISS")
         st.caption("""
         ARISS (Aggregate Real-time Internet Sentiment Score) aggregates sentiment 
         from Reddit, YouTube, and Twitter to create a real-time score (0-100) of 
-        internet opinion.
+        internet opinion using context-aware AI analysis.
         
         - **0-30**: Very Negative
         - **30-45**: Negative  
         - **45-55**: Neutral
         - **55-70**: Positive
         - **70-100**: Very Positive
-        
-        Scores are weighted by source credibility, comment length, and 
-        adjusted for bias.
         """)
     
     # Main content
     if st.session_state.current_subject:
         subject = st.session_state.current_subject
-        
-        # Get database instance
-        db = get_database()
         
         # Get latest score
         latest = db.get_latest_score(subject)
@@ -470,32 +503,28 @@ def main():
                 )
                 st.metric(
                     "Confidence",
-                    f"{latest['confidence']:.0f}%"
+                    f"{latest.get('confidence', 0):.0f}%"
                 )
                 st.metric(
                     "Sample Size",
-                    f"{latest['sample_size']}"
+                    f"{latest.get('sample_size', 0)}"
                 )
             
             with col3:
-                st.markdown("### Quality")
+                st.markdown("### Distribution")
                 st.metric(
-                    "Avg Credibility",
-                    f"{latest.get('mean_credibility', 0):.0f}/100"
+                    "Positive",
+                    f"{latest.get('positive_pct', 0):.0f}%",
+                    delta=None,
+                    delta_color="normal"
                 )
                 st.metric(
-                    "Avg Bias",
-                    f"{latest.get('mean_bias', 0):.0f}/100"
+                    "Neutral",
+                    f"{latest.get('neutral_pct', 0):.0f}%"
                 )
                 st.metric(
-                    "Avg Word Count",
-                    f"{latest.get('mean_word_count', 0):.0f} words",
-                    help="Average number of words per comment. Higher = more substantive."
-                )
-                st.metric(
-                    "Length Weight",
-                    f"{latest.get('mean_length_weight', 1.0):.2f}",
-                    help="Average comment length weight (0.1–1.0). Higher = comments were more substantive."
+                    "Negative",
+                    f"{latest.get('negative_pct', 0):.0f}%"
                 )
             
             # Source breakdown
@@ -556,14 +585,15 @@ def main():
             else:
                 st.info("No historical data available yet. Refresh the score a few times to build history.")
             
-            # Recent comments
+            # Recent comments analysis
             st.divider()
             st.header("💬 Recent Comments Analysis")
             
-            sentiment_df = db.get_sentiment_details(subject, limit=50)
+            # Get sentiment details from database
+            sentiment_df = db.get_sentiment_details(subject, limit=100)
             
             if not sentiment_df.empty:
-                # Show distribution
+                # Show distribution histogram
                 fig = px.histogram(
                     sentiment_df,
                     x='claude_score',
@@ -572,7 +602,7 @@ def main():
                     labels={'claude_score': 'Sentiment Score', 'count': 'Number of Comments'},
                     color_discrete_sequence=['#667eea']
                 )
-                fig.add_vline(x=50, line_dash="dash", line_color="gray")
+                fig.add_vline(x=50, line_dash="dash", line_color="gray", annotation_text="Neutral")
                 st.plotly_chart(fig, use_container_width=True)
                 
                 # Show sample comments
@@ -583,7 +613,7 @@ def main():
                 with col1:
                     filter_sentiment = st.selectbox(
                         "Filter by Sentiment",
-                        ["All", "Positive (>55)", "Neutral (45-55)", "Negative (<45)"]
+                        ["All", "Positive (>60)", "Neutral (40-60)", "Negative (<40)"]
                     )
                 
                 with col2:
@@ -596,34 +626,73 @@ def main():
                 filtered_df = sentiment_df.copy()
                 
                 if filter_sentiment != "All":
-                    if filter_sentiment == "Positive (>55)":
-                        filtered_df = filtered_df[filtered_df['claude_score'] > 55]
-                    elif filter_sentiment == "Neutral (45-55)":
+                    if filter_sentiment == "Positive (>60)":
+                        filtered_df = filtered_df[filtered_df['claude_score'] > 60]
+                    elif filter_sentiment == "Neutral (40-60)":
                         filtered_df = filtered_df[
-                            (filtered_df['claude_score'] >= 45) & 
-                            (filtered_df['claude_score'] <= 55)
+                            (filtered_df['claude_score'] >= 40) & 
+                            (filtered_df['claude_score'] <= 60)
                         ]
                     else:  # Negative
-                        filtered_df = filtered_df[filtered_df['claude_score'] < 45]
+                        filtered_df = filtered_df[filtered_df['claude_score'] < 40]
                 
                 if filter_source != "All":
                     filtered_df = filtered_df[filtered_df['source'] == filter_source]
                 
                 # Display comments
                 for idx, row in filtered_df.head(10).iterrows():
-                    wc   = int(row.get('word_count', 0))
-                    lw   = float(row.get('length_weight', 1.0))
+                    score = row['claude_score']
+                    upvotes = row.get('upvotes', 0)
+                    
+                    # Color-code by sentiment
+                    if score >= 60:
+                        sentiment_emoji = "😊"
+                        sentiment_color = "#10b981"
+                    elif score >= 40:
+                        sentiment_emoji = "😐"
+                        sentiment_color = "#6b7280"
+                    else:
+                        sentiment_emoji = "😠"
+                        sentiment_color = "#ef4444"
+                    
                     with st.expander(
-                        f"💬 {row['source'].title()} — Score: {row['claude_score']:.0f}/100 "
-                        f"| {wc} words "
-                        f"({'↑' if row['upvotes'] > 0 else ''}{row['upvotes']})"
+                        f"{sentiment_emoji} **{row['source'].title()}** — Score: {score:.0f}/100 "
+                        f"| {row.get('word_count', 0)} words "
+                        f"({'↑' if upvotes > 0 else ''}{upvotes})"
                     ):
+                        # Display comment text
+                        st.markdown(f"**Comment:**")
                         st.write(row['text'])
+                        
+                        # Display metrics
+                        st.markdown("---")
                         col1, col2, col3, col4 = st.columns(4)
-                        col1.caption(f"Credibility: {row['source_credibility']:.0f}/100")
-                        col2.caption(f"Bias: {row['bias_score']:.0f}/100")
-                        col3.caption(f"Length weight: {lw:.2f}")
-                        col4.caption(f"Posted: {row['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                        
+                        with col1:
+                            st.caption(f"**Sentiment Score**")
+                            st.markdown(f"<span style='color: {sentiment_color}; font-size: 1.5rem; font-weight: bold;'>{score:.0f}/100</span>", unsafe_allow_html=True)
+                        
+                        with col2:
+                            st.caption(f"**Credibility**")
+                            st.write(f"{row.get('source_credibility', 50):.0f}/100")
+                        
+                        with col3:
+                            st.caption(f"**Bias**")
+                            bias = row.get('bias_score', 50)
+                            bias_label = "Low" if bias < 30 else "Medium" if bias < 60 else "High"
+                            st.write(f"{bias:.0f}/100 ({bias_label})")
+                        
+                        with col4:
+                            st.caption(f"**Posted**")
+                            st.write(row['timestamp'].strftime('%Y-%m-%d'))
+                
+                if len(filtered_df) == 0:
+                    st.info("No comments match the selected filters.")
+                elif len(filtered_df) > 10:
+                    st.caption(f"Showing 10 of {len(filtered_df)} filtered comments")
+            else:
+                st.info("No comment data available. Calculate a new score to see individual comments.")
+        
         else:
             st.error(f"No data found for '{subject}'. Try calculating a new score.")
     
@@ -639,10 +708,10 @@ def main():
         
         ### How it works:
         
-        1. **Scrape**: Collect recent comments from major social platforms
-        2. **Analyze**: Use advanced NLP to measure sentiment and detect bias
-        3. **Weight**: Adjust for comment length, source credibility, and extremism
-        4. **Score**: Calculate a real-time sentiment score from 0-100
+        1. **Context**: Fetch recent news/events about the subject
+        2. **Scrape**: Collect recent comments from social platforms
+        3. **Analyze**: Use context-aware AI to understand sentiment
+        4. **Score**: Calculate net sentiment score from 0-100
         
         ### Get Started:
         
@@ -650,9 +719,6 @@ def main():
         
         ### Popular Subjects:
         """)
-        
-        # Get database instance
-        db = get_database()
         
         # Show some subjects if they exist
         subjects = db.get_all_subjects()

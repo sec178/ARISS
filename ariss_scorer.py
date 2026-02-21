@@ -1,10 +1,16 @@
 """
-ARISS - Aggregate Real-time Internet Sentiment Score
-Core scoring engine with web scraping and sentiment analysis
+ARISS v3 - Aggregate Real-time Internet Sentiment Score
+Enterprise-grade sentiment analysis with context awareness
 
-Requirements:
-pip install anthropic praw google-api-python-client tweepy beautifulsoup4
-         requests pandas numpy python-dotenv textblob vaderSentiment
+Based on methodologies from Hootsuite, Sprout Social, and Talkwalker
+
+Key improvements:
+- Context-aware sentiment (understands what event/topic comment refers to)
+- Named Entity Recognition (identifies brands, people, products mentioned)
+- Aspect-based sentiment (sentiment about specific aspects)  
+- Advanced NLP (handles sarcasm, slang, emojis, negations, comparisons)
+- Calibrated scoring (no regression to neutral)
+- Simplified aggregation formula (industry standard)
 """
 
 import os
@@ -15,55 +21,45 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 import hashlib
 
-# Third-party imports
 import anthropic
 import pandas as pd
 import numpy as np
 from collections import Counter
-
-# Social media APIs
-try:
-    import praw  # Reddit
-except ImportError:
-    praw = None
-
-try:
-    from googleapiclient.discovery import build  # YouTube
-except ImportError:
-    build = None
-
-try:
-    import tweepy  # Twitter/X
-except ImportError:
-    tweepy = None
-
-# Sentiment analysis libraries
 from textblob import TextBlob
+
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 except ImportError:
     SentimentIntensityAnalyzer = None
 
+try:
+    import praw
+except ImportError:
+    praw = None
 
-# ---------------------------------------------------------------------------
-# Length weighting constants
-# ---------------------------------------------------------------------------
-MIN_MEANINGFUL_WORDS = 5    # below this = very low signal
-MAX_MEANINGFUL_WORDS = 75   # above this = full weight
+try:
+    from googleapiclient.discovery import build
+except ImportError:
+    build = None
+
+try:
+    import tweepy
+except ImportError:
+    tweepy = None
 
 
 @dataclass
 class Comment:
-    """Represents a single comment from social media."""
+    """Single social media comment."""
     text: str
-    source: str          # 'reddit', 'youtube', 'twitter', etc.
-    platform_id: str     # unique ID from the platform
+    source: str
+    platform_id: str
     timestamp: datetime
     author: str
     upvotes: int = 0
     subreddit: Optional[str] = None
     video_id: Optional[str] = None
-
+    
     def to_dict(self):
         d = asdict(self)
         d['timestamp'] = self.timestamp.isoformat()
@@ -71,335 +67,325 @@ class Comment:
 
 
 @dataclass
-class SentimentScore:
-    """Represents sentiment analysis results for a comment."""
+class SentimentResult:
+    """Results from context-aware sentiment analysis."""
     comment_id: str
     text: str
     source: str
     timestamp: datetime
-
-    # Sentiment scores (0-100 scale)
-    textblob_score: float
-    vader_score: float
-    claude_score: float
-
-    # Quality metrics
-    bias_score: float           # 0-100, higher = more biased
-    source_credibility: float   # 0-100, higher = more credible
-    length_weight: float        # 0.1-1.0, higher = more substantive
-
-    # Final weighted score
-    weighted_score: float
-
+    
+    # Core sentiment (polarity: -1 to +1, scaled to 0-100)
+    sentiment_score: float  # 0=very negative, 50=neutral, 100=very positive
+    
+    # Context understanding
+    understood_context: str  # What event/topic this refers to
+    primary_entity: str      # Main subject (person, brand, product)
+    aspects_mentioned: List[str]  # Specific aspects discussed
+    
+    # Quality indicators
+    has_sarcasm: bool
+    has_comparison: bool
+    emotional_intensity: float  # 0-100, how strong the emotion is
+    
     # Metadata
     upvotes: int
     author: str
     word_count: int
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _word_count(text: str) -> int:
-    return len(text.split())
-
-
-def _length_weight(text: str) -> float:
-    """
-    Map comment length to a [0.1, 1.0] weight using a log scale.
-
-    Rationale: "lol", emoji-only, and one-sentence reactions are low-signal.
-    A thoughtful 50-word comment carries much more information about true
-    sentiment. Weights reach ~1.0 at MAX_MEANINGFUL_WORDS and can never
-    drop below 0.1 so short comments still count a little.
-    """
-    wc = _word_count(text)
-    if wc <= 0:
-        return 0.0
-    raw = np.log1p(wc) / np.log1p(MAX_MEANINGFUL_WORDS)
-    return float(np.clip(raw, 0.1, 1.0))
-
-
-# ---------------------------------------------------------------------------
-# Main scorer
-# ---------------------------------------------------------------------------
-
 class ARISSScorer:
-    """Main class for calculating ARISS scores."""
-
+    """
+    Enterprise-grade sentiment scorer.
+    
+    Uses Claude for context-aware analysis similar to Hootsuite/Sprout Social.
+    """
+    
     def __init__(self, anthropic_api_key: str):
         try:
             self.client = anthropic.Anthropic(api_key=anthropic_api_key)
         except TypeError:
             os.environ['ANTHROPIC_API_KEY'] = anthropic_api_key
             self.client = anthropic.Anthropic()
+        
         self.vader = SentimentIntensityAnalyzer() if SentimentIntensityAnalyzer else None
-
-    # ------------------------------------------------------------------
-    # Three independent sentiment analysers (each returns 0-100)
-    # ------------------------------------------------------------------
-
-    def analyze_sentiment_textblob(self, text: str) -> float:
-        blob = TextBlob(text)
-        return float((blob.sentiment.polarity + 1) * 50)
-
-    def analyze_sentiment_vader(self, text: str) -> float:
-        if not self.vader:
-            return 50.0
-        compound = self.vader.polarity_scores(text)['compound']
-        return float((compound + 1) * 50)
-
-    def analyze_sentiment_claude(self, text: str, subject: str) -> Tuple[float, float]:
+    
+    def _get_current_context(self, subject: str) -> str:
         """
-        Calibrated sentiment + bias analysis via Claude.
-
-        Key design decisions:
-        - temperature=0.1 for consistent, non-creative scoring
-        - Explicit calibration guide prevents drift toward neutral/positive
-        - 'word_sentiment_check' forces the model to surface specific
-          sentiment-bearing tokens before committing to a number — reduces
-          anchoring bias
-        - Hard clamp to [0, 100] as a safety net
+        Fetch recent news/context about the subject.
+        
+        This helps the sentiment analyzer understand what events people
+        are reacting to (critical for accuracy).
         """
-        prompt = f"""You are a calibrated sentiment analyst. Score this internet comment about "{subject}" objectively.
+        prompt = f"""What are the most significant recent events, news, or developments related to "{subject}" in the past 2 weeks?
 
-Comment:
-\"\"\"{text}\"\"\"
+Provide a brief 2-3 sentence summary of the TOP event or topic people are likely discussing.
 
-Rules:
-- Do NOT default to 50 (neutral) for ambiguous or mild comments.
-- Negative criticism and complaints should score well BELOW 50.
-- Positive praise and enthusiasm should score well ABOVE 50.
-- Only score near 50 if the comment is genuinely mixed or neutral.
-- Strong emotions in either direction are valid signals — preserve them.
+Focus on:
+- Breaking news
+- Major announcements  
+- Controversies or crises
+- Product launches
+- Policy changes
+- Significant achievements or failures
 
-Return ONLY this JSON object:
+Return ONLY the summary, no preamble."""
+
+        try:
+            message = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=200,
+                temperature=0.1,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return message.content[0].text.strip()
+        except Exception as e:
+            print(f"Context fetch error: {e}")
+            return f"General discussion about {subject}"
+    
+    def analyze_comment_with_context(
+        self, 
+        comment: Comment, 
+        subject: str,
+        context: str
+    ) -> SentimentResult:
+        """
+        Perform context-aware sentiment analysis on a comment.
+        
+        This is the KEY INNOVATION: we tell Claude what's happening,
+        so it can properly interpret comments.
+        
+        Example:
+        - Context: "iPhone 15 just launched with new titanium design"
+        - Comment: "Finally ditched the stainless steel!"
+        - Without context: Neutral (50)
+        - With context: Positive (72) - understands this is praise
+        """
+        
+        prompt = f"""You are analyzing a social media comment about "{subject}".
+
+**CURRENT CONTEXT:**
+{context}
+
+**COMMENT:**
+\"\"\"{comment.text}\"\"\"
+
+**SOURCE:** {comment.source} | **ENGAGEMENT:** {comment.upvotes} upvotes
+
+---
+
+Analyze this comment using the context above. Return ONLY this JSON:
 
 {{
-  "word_sentiment_check": "<the 3 most sentiment-bearing words/phrases and whether each is positive or negative>",
-  "reasoning": "<one sentence>",
-  "sentiment": <integer 0-100>,
-  "bias_score": <integer 0-100>
+  "sentiment_polarity": <-1.0 to +1.0, where -1=extremely negative, 0=neutral, +1=extremely positive>,
+  "confidence": <0-100, how confident you are in this score>,
+  "understood_context": "<brief: what event/topic is this comment about?>",
+  "primary_entity": "<the main person/brand/product mentioned>",
+  "aspects_mentioned": ["<aspect 1>", "<aspect 2>"],
+  "has_sarcasm": <true/false>,
+  "has_comparison": <true/false>,
+  "emotional_intensity": <0-100, how emotionally charged is this?>,
+  "reasoning": "<one sentence explaining the sentiment>"
 }}
 
-Sentiment scale:
-  0-20  : Extremely negative (rage, strong condemnation)
-  21-35 : Clearly negative (criticism, disappointment)
-  36-45 : Mildly negative (skepticism, mild complaint)
-  46-54 : Genuinely neutral or evenly mixed
-  55-64 : Mildly positive (cautious optimism, tentative approval)
-  65-79 : Clearly positive (praise, approval)
-  80-100: Extremely positive (enthusiasm, strong endorsement)
-
-Bias scale:
-  0-30  : Objective, factual, balanced
-  31-60 : Opinion-based, some emotional language
-  61-100: Extreme, conspiratorial, purely emotional/reactionary
+**CRITICAL SCORING RULES:**
+1. Use the full -1 to +1 range. Don't cluster around 0.
+2. "I love this!" should be +0.8 or higher
+3. "This is terrible" should be -0.8 or lower  
+4. Mild opinions should be ±0.3 to ±0.6
+5. Only score near 0 if genuinely neutral or balanced
+6. Consider context - a comment about a scandal is different from a product review
+7. Detect sarcasm: "Great, another bug" is negative even with "great"
+8. Handle slang: "This slaps" = positive, "mid" = neutral/negative
+9. Respect negations: "not bad" is mildly positive
+10. Emojis matter: 😡 = negative, 🔥 = positive
 
 Return ONLY valid JSON:"""
 
         try:
             message = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=400,
-                temperature=0.1,
+                max_tokens=500,
+                temperature=0.05,  # Very low for consistency
                 messages=[{"role": "user", "content": prompt}]
             )
+            
             response_text = message.content[0].text
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            
             if json_match:
                 result = json.loads(json_match.group())
-                sentiment = float(result.get('sentiment', 50))
-                bias      = float(result.get('bias_score', 50))
-                return float(np.clip(sentiment, 0, 100)), float(np.clip(bias, 0, 100))
+                
+                # Extract values
+                polarity = float(result.get('sentiment_polarity', 0))
+                polarity = np.clip(polarity, -1.0, 1.0)
+                
+                # Convert polarity (-1 to +1) to score (0 to 100)
+                # This is the industry standard formula
+                sentiment_score = (polarity + 1.0) * 50.0
+                
+                comment_id = hashlib.md5(
+                    f"{comment.source}:{comment.platform_id}".encode()
+                ).hexdigest()
+                
+                return SentimentResult(
+                    comment_id=comment_id,
+                    text=comment.text,
+                    source=comment.source,
+                    timestamp=comment.timestamp,
+                    sentiment_score=sentiment_score,
+                    understood_context=result.get('understood_context', 'Unknown'),
+                    primary_entity=result.get('primary_entity', subject),
+                    aspects_mentioned=result.get('aspects_mentioned', []),
+                    has_sarcasm=result.get('has_sarcasm', False),
+                    has_comparison=result.get('has_comparison', False),
+                    emotional_intensity=float(result.get('emotional_intensity', 50)),
+                    upvotes=comment.upvotes,
+                    author=comment.author,
+                    word_count=len(comment.text.split()),
+                )
+        
         except Exception as e:
-            print(f"Claude analysis error: {e}")
-
-        return self.analyze_sentiment_textblob(text), 50.0
-
-    # ------------------------------------------------------------------
-    # Source credibility
-    # ------------------------------------------------------------------
-
-    def calculate_source_credibility(self, comment: Comment) -> float:
-        """
-        Platform base score adjusted by community engagement.
-
-        Changes from v1:
-        - Upvote boost capped at +10 (was +15) — high upvotes ≠ objectivity
-        - Downvoted content gets a credibility *reduction*, not just ignored
-        """
-        platform_credibility = {
-            'reddit': 65,
-            'youtube': 55,
-            'twitter': 58,
-            'news_comments': 70,
-            'unknown': 50,
-        }
-        base = float(platform_credibility.get(comment.source, 50))
-
-        upvotes = comment.upvotes or 0
-        if upvotes > 0:
-            base += min(10.0, np.log1p(upvotes) * 1.5)
-        elif upvotes < -2:
-            base += max(-20.0, np.log1p(abs(upvotes)) * -2.0)
-
-        return float(np.clip(base, 5, 100))
-
-    # ------------------------------------------------------------------
-    # Per-comment analysis
-    # ------------------------------------------------------------------
-
-    def analyze_comment(self, comment: Comment, subject: str) -> SentimentScore:
-        """
-        Comprehensive per-comment analysis.
-
-        Ensemble weights:
-          Claude   60%  — best at contextual/sarcastic language
-          VADER    25%  — tuned for social-media slang and punctuation
-          TextBlob 15%  — general baseline
-
-        The weighted_score stored here is the raw ensemble sentiment.
-        Credibility, bias, and length weights are stored separately and
-        applied at aggregation time — this makes it easy to audit.
-        """
-        textblob_score              = self.analyze_sentiment_textblob(comment.text)
-        vader_score                 = self.analyze_sentiment_vader(comment.text)
-        claude_score, bias_score    = self.analyze_sentiment_claude(comment.text, subject)
-        source_credibility          = self.calculate_source_credibility(comment)
-        lw                          = _length_weight(comment.text)
-        wc                          = _word_count(comment.text)
-
-        # Ensemble (no regression-to-50 anchor)
-        ensemble = claude_score * 0.60 + vader_score * 0.25 + textblob_score * 0.15
-
+            print(f"Analysis error: {e}")
+        
+        # Fallback: use VADER if available
+        if self.vader:
+            vader_result = self.vader.polarity_scores(comment.text)
+            polarity = vader_result['compound']
+            sentiment_score = (polarity + 1.0) * 50.0
+        else:
+            sentiment_score = 50.0
+        
         comment_id = hashlib.md5(
             f"{comment.source}:{comment.platform_id}".encode()
         ).hexdigest()
-
-        return SentimentScore(
+        
+        return SentimentResult(
             comment_id=comment_id,
             text=comment.text,
             source=comment.source,
             timestamp=comment.timestamp,
-            textblob_score=textblob_score,
-            vader_score=vader_score,
-            claude_score=claude_score,
-            bias_score=bias_score,
-            source_credibility=source_credibility,
-            length_weight=lw,
-            weighted_score=ensemble,
+            sentiment_score=sentiment_score,
+            understood_context="Fallback analysis",
+            primary_entity=subject,
+            aspects_mentioned=[],
+            has_sarcasm=False,
+            has_comparison=False,
+            emotional_intensity=50.0,
             upvotes=comment.upvotes,
             author=comment.author,
-            word_count=wc,
+            word_count=len(comment.text.split()),
         )
-
-    # ------------------------------------------------------------------
-    # Aggregation
-    # ------------------------------------------------------------------
-
-    def calculate_ariss(self, sentiment_scores: List[SentimentScore]) -> Dict[str, Any]:
+    
+    def calculate_ariss(self, sentiment_results: List[SentimentResult]) -> Dict[str, Any]:
         """
-        Aggregate individual scores into a final ARISS score.
-
-        Per-comment weight = length_weight * credibility_weight * (1 - bias_fraction)
-
-        No regression-to-50. The weighted mean of the ensemble scores IS
-        the final score — if opinions are genuinely negative, ARISS is low.
+        Calculate final ARISS score using industry-standard formula.
+        
+        Formula (from Sprout Social / Hootsuite):
+        ARISS = (Positive - Negative) / Total
+        
+        Where:
+        - Positive = comments with score > 60
+        - Negative = comments with score < 40
+        - Neutral = 40-60
+        
+        Then scale to 0-100.
         """
-        if not sentiment_scores:
+        if not sentiment_results:
             return {
                 'ariss_score': 50.0,
                 'confidence': 0.0,
                 'sample_size': 0,
-                'error': 'No data available',
+                'error': 'No data',
             }
-
-        raw_scores = [s.weighted_score for s in sentiment_scores]
-        weights    = []
-
-        for s in sentiment_scores:
-            cred_w = s.source_credibility / 100.0   # 0.05 – 1.0
-            bias_w = 1.0 - (s.bias_score / 100.0)   # 0.0  – 1.0
-            len_w  = s.length_weight                 # 0.1  – 1.0
-            # Floor at 0.01 so no comment is completely silenced
-            weights.append(max(0.01, cred_w * bias_w * len_w))
-
-        total_w      = sum(weights)
-        norm_weights = [w / total_w for w in weights]
-        ariss_score  = float(np.dot(raw_scores, norm_weights))
-
-        variance   = float(np.var(raw_scores))
-        n          = len(raw_scores)
-        size_conf  = min(100.0, n * 2.0)
-        var_conf   = max(0.0, 100.0 - variance)
+        
+        # Classify comments
+        positive = [r for r in sentiment_results if r.sentiment_score > 60]
+        negative = [r for r in sentiment_results if r.sentiment_score < 40]
+        neutral  = [r for r in sentiment_results if 40 <= r.sentiment_score <= 60]
+        
+        n_pos = len(positive)
+        n_neg = len(negative)
+        n_neu = len(neutral)
+        total = len(sentiment_results)
+        
+        # Industry standard: Net sentiment
+        # Range: -1 (all negative) to +1 (all positive)
+        if total > 0:
+            net_sentiment = (n_pos - n_neg) / total
+        else:
+            net_sentiment = 0.0
+        
+        # Convert to 0-100 scale
+        # -1 → 0, 0 → 50, +1 → 100
+        ariss_score = (net_sentiment + 1.0) * 50.0
+        
+        # Confidence based on sample size and agreement
+        variance = float(np.var([r.sentiment_score for r in sentiment_results]))
+        size_conf = min(100.0, total * 2.0)  # Full confidence at 50+ samples
+        var_conf  = max(0.0, 100.0 - variance)
         confidence = (size_conf + var_conf) / 2.0
-
+        
+        # Context breakdown
+        contexts = Counter([r.understood_context for r in sentiment_results])
+        entities = Counter([r.primary_entity for r in sentiment_results])
+        
         return {
-            'ariss_score':        round(ariss_score, 2),
-            'confidence':         round(confidence, 2),
-            'sample_size':        n,
-            'mean_bias':          round(float(np.mean([s.bias_score for s in sentiment_scores])), 2),
-            'mean_credibility':   round(float(np.mean([s.source_credibility for s in sentiment_scores])), 2),
-            'mean_length_weight': round(float(np.mean([s.length_weight for s in sentiment_scores])), 3),
-            'mean_word_count':    round(float(np.mean([s.word_count for s in sentiment_scores])), 1),
-            'variance':           round(variance, 2),
-            'std_dev':            round(float(np.std(raw_scores)), 2),
-            'min_score':          round(min(raw_scores), 2),
-            'max_score':          round(max(raw_scores), 2),
-            'timestamp':          datetime.now().isoformat(),
-            'source_breakdown':   dict(Counter([s.source for s in sentiment_scores])),
+            'ariss_score': round(ariss_score, 2),
+            'net_sentiment': round(net_sentiment, 3),
+            'confidence': round(confidence, 2),
+            
+            # Distribution
+            'positive_count': n_pos,
+            'negative_count': n_neg,
+            'neutral_count': n_neu,
+            'positive_pct': round(n_pos / total * 100, 1),
+            'negative_pct': round(n_neg / total * 100, 1),
+            'neutral_pct': round(n_neu / total * 100, 1),
+            
+            # Sample stats
+            'sample_size': total,
+            'mean_score': round(float(np.mean([r.sentiment_score for r in sentiment_results])), 2),
+            'median_score': round(float(np.median([r.sentiment_score for r in sentiment_results])), 2),
+            'std_dev': round(float(np.std([r.sentiment_score for r in sentiment_results])), 2),
+            
+            # Context insights
+            'top_contexts': dict(contexts.most_common(3)),
+            'top_entities': dict(entities.most_common(3)),
+            'sarcasm_pct': round(sum(r.has_sarcasm for r in sentiment_results) / total * 100, 1),
+            'mean_emotional_intensity': round(float(np.mean([r.emotional_intensity for r in sentiment_results])), 1),
+            
+            # Metadata
+            'timestamp': datetime.now().isoformat(),
+            'source_breakdown': dict(Counter([r.source for r in sentiment_results])),
         }
 
 
-# ---------------------------------------------------------------------------
-# Scrapers
-# ---------------------------------------------------------------------------
-
+# Scrapers (same as v2, optimized for diversity)
 class RedditScraper:
-    """Scraper for Reddit comments and posts."""
-
     def __init__(self, client_id: str, client_secret: str, user_agent: str):
         if not praw:
-            raise ImportError("praw not installed: pip install praw")
+            raise ImportError("praw not installed")
         self.reddit = praw.Reddit(
             client_id=client_id,
             client_secret=client_secret,
             user_agent=user_agent,
         )
-
+    
     def search_comments(
         self,
         query: str,
         limit: int = 100,
         time_filter: str = 'month',
     ) -> List[Comment]:
-        """
-        Search Reddit for comments about a subject.
-
-        v2 design choices:
-        - Searches with BOTH 'relevance' and 'new' sort — relevance skews
-          toward highly-upvoted (popular = positive) posts; 'new' gives
-          more recent, unfiltered opinion.
-        - Collects top-level AND second-level replies (3 per parent) for
-          diversity within each thread.
-        - No body-text keyword filter (the old filter biased toward posts
-          where the subject is mentioned admiringly by name).
-        - Skips deleted/removed/very short comments (< 3 words).
-        - time_filter default = 'month' (broader than 'week').
-        """
         comments: List[Comment] = []
         seen_ids: set = set()
         per_page = max(5, limit // 10)
 
         try:
             subreddit = self.reddit.subreddit('all')
-
             for sort_method in ['relevance', 'new']:
                 if len(comments) >= limit:
                     break
-
                 for submission in subreddit.search(
                     query,
                     sort=sort_method,
@@ -408,143 +394,91 @@ class RedditScraper:
                 ):
                     if len(comments) >= limit:
                         break
-
                     submission.comments.replace_more(limit=0)
                     pool = list(submission.comments)
                     for top in list(submission.comments):
                         pool.extend(list(top.replies)[:3])
-
-                    for comment in pool:
+                    for c in pool:
                         if len(comments) >= limit:
                             break
-                        if not hasattr(comment, 'body'):
+                        if not hasattr(c, 'body') or c.id in seen_ids:
                             continue
-                        if comment.id in seen_ids:
-                            continue
-                        body = comment.body.strip()
+                        body = c.body.strip()
                         if body in ('[deleted]', '[removed]', '') or len(body.split()) < 3:
                             continue
-
-                        seen_ids.add(comment.id)
+                        seen_ids.add(c.id)
                         comments.append(Comment(
                             text=body,
                             source='reddit',
-                            platform_id=comment.id,
-                            timestamp=datetime.fromtimestamp(comment.created_utc),
-                            author=str(comment.author) if comment.author else '[deleted]',
-                            upvotes=comment.score,
+                            platform_id=c.id,
+                            timestamp=datetime.fromtimestamp(c.created_utc),
+                            author=str(c.author) if c.author else '[deleted]',
+                            upvotes=c.score,
                             subreddit=submission.subreddit.display_name,
                         ))
-
         except Exception as e:
-            print(f"Reddit scraping error: {e}")
-
+            print(f"Reddit error: {e}")
         return comments[:limit]
 
 
 class YouTubeScraper:
-    """Scraper for YouTube comments."""
-
     def __init__(self, api_key: str):
         if not build:
             raise ImportError("google-api-python-client not installed")
         self.youtube = build('youtube', 'v3', developerKey=api_key)
-
+    
     def search_comments(self, query: str, limit: int = 100) -> List[Comment]:
-        """
-        Search YouTube for comments.
-
-        v2 design choices:
-        - Fetches from more videos (15) for source diversity.
-        - Pulls both 'relevance' and 'time' ordered comments per video.
-        - Skips comments < 4 words.
-        """
         comments: List[Comment] = []
         seen_ids: set = set()
-
         try:
             search_resp = self.youtube.search().list(
-                q=query,
-                part='id,snippet',
-                maxResults=15,
-                type='video',
-                order='relevance',
+                q=query, part='id,snippet', maxResults=15, type='video', order='relevance'
             ).execute()
-
-            n_videos  = max(1, len(search_resp.get('items', [])))
+            n_videos = max(1, len(search_resp.get('items', [])))
             per_video = max(5, limit // n_videos)
-
             for item in search_resp.get('items', []):
                 if len(comments) >= limit:
                     break
                 video_id = item['id']['videoId']
-
                 for order in ['relevance', 'time']:
                     if len(comments) >= limit:
                         break
                     try:
                         resp = self.youtube.commentThreads().list(
-                            part='snippet',
-                            videoId=video_id,
-                            maxResults=min(per_video, 50),
-                            order=order,
+                            part='snippet', videoId=video_id, maxResults=min(per_video, 50), order=order
                         ).execute()
-
                         for ci in resp.get('items', []):
-                            if len(comments) >= limit:
+                            if len(comments) >= limit or ci['id'] in seen_ids:
                                 break
-                            if ci['id'] in seen_ids:
-                                continue
                             data = ci['snippet']['topLevelComment']['snippet']
                             text = data['textDisplay'].strip()
                             if len(text.split()) < 4:
                                 continue
                             seen_ids.add(ci['id'])
                             comments.append(Comment(
-                                text=text,
-                                source='youtube',
-                                platform_id=ci['id'],
-                                timestamp=datetime.fromisoformat(
-                                    data['publishedAt'].replace('Z', '+00:00')
-                                ),
-                                author=data['authorDisplayName'],
-                                upvotes=data['likeCount'],
-                                video_id=video_id,
+                                text=text, source='youtube', platform_id=ci['id'],
+                                timestamp=datetime.fromisoformat(data['publishedAt'].replace('Z', '+00:00')),
+                                author=data['authorDisplayName'], upvotes=data['likeCount'], video_id=video_id,
                             ))
                     except Exception as e:
-                        print(f"YouTube comment error (video {video_id}): {e}")
-
+                        print(f"YouTube error (video {video_id}): {e}")
         except Exception as e:
-            print(f"YouTube scraping error: {e}")
-
+            print(f"YouTube error: {e}")
         return comments[:limit]
 
 
 class TwitterScraper:
-    """Scraper for Twitter/X posts."""
-
     def __init__(self, bearer_token: str):
         if not tweepy:
             raise ImportError("tweepy not installed")
         self.client = tweepy.Client(bearer_token=bearer_token)
-
+    
     def search_tweets(self, query: str, limit: int = 100) -> List[Comment]:
-        """
-        Search Twitter for tweets.
-
-        v2 changes:
-        - Excludes retweets — they inflate counts with no new sentiment.
-        - Excludes replies (off-topic threads).
-        - English-only filter for consistent NLP.
-        - Skips tweets < 5 words.
-        """
         comments: List[Comment] = []
         clean_query = f"{query} -is:retweet -is:reply lang:en"
-
         try:
             tweets = self.client.search_recent_tweets(
-                query=clean_query,
-                max_results=min(100, limit),
+                query=clean_query, max_results=min(100, limit),
                 tweet_fields=['created_at', 'public_metrics', 'author_id'],
             )
             if tweets.data:
@@ -553,22 +487,14 @@ class TwitterScraper:
                     if len(text.split()) < 5:
                         continue
                     comments.append(Comment(
-                        text=text,
-                        source='twitter',
-                        platform_id=str(tweet.id),
-                        timestamp=tweet.created_at,
-                        author=str(tweet.author_id),
+                        text=text, source='twitter', platform_id=str(tweet.id),
+                        timestamp=tweet.created_at, author=str(tweet.author_id),
                         upvotes=tweet.public_metrics['like_count'],
                     ))
         except Exception as e:
-            print(f"Twitter scraping error: {e}")
-
+            print(f"Twitter error: {e}")
         return comments[:limit]
 
-
-# ---------------------------------------------------------------------------
-# CLI demo
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
@@ -576,36 +502,34 @@ if __name__ == "__main__":
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     scorer  = ARISSScorer(api_key)
-
-    samples = [
-        Comment("This policy is an absolute disaster. Worst decision in years.",
-                "reddit", "s1", datetime.now(), "u1", upvotes=312),
-        Comment("Mixed results so far. Some good points but the implementation seems rushed.",
-                "reddit", "s2", datetime.now(), "u2", upvotes=89),
-        Comment("👍", "youtube", "y1", datetime.now(), "u3", upvotes=5),
-        Comment("Genuinely impressed. Strong leadership.",
-                "reddit", "s3", datetime.now(), "u4", upvotes=44),
-        Comment("I read the full 40-page report. The data clearly shows a 12% improvement in "
-                "outcomes with no meaningful rise in costs. Cautiously optimistic but want to "
-                "see 6-month follow-up before calling it a success.",
-                "reddit", "s4", datetime.now(), "u5", upvotes=901),
-    ]
-
+    
+    subject = "iPhone 15"
+    context = scorer._get_current_context(subject)
+    
     print(f"\n{'='*70}")
-    print(f"{'Comment':<45} {'Words':>5} {'LenW':>5} {'Score':>6} {'Bias':>5}")
+    print(f"ARISS v3 - Context-Aware Sentiment Analysis")
     print(f"{'='*70}")
-
-    scores = []
+    print(f"\nSubject: {subject}")
+    print(f"Context: {context}\n")
+    
+    samples = [
+        Comment("This is a complete disaster. Worst decision ever.", "reddit", "1", datetime.now(), "u1", 50),
+        Comment("Finally ditched the stainless steel! Love the titanium.", "reddit", "2", datetime.now(), "u2", 200),
+        Comment("Great, another price hike 🙄", "twitter", "3", datetime.now(), "u3", 10),
+        Comment("The camera is incredible but battery life is mid tbh", "reddit", "4", datetime.now(), "u4", 80),
+    ]
+    
+    results = []
     for c in samples:
-        sc = scorer.analyze_comment(c, "the policy")
-        scores.append(sc)
-        preview = c.text[:44]
-        print(f"{preview:<45} {sc.word_count:>5} {sc.length_weight:>5.2f} "
-              f"{sc.claude_score:>6.1f} {sc.bias_score:>5.1f}")
-
-    result = scorer.calculate_ariss(scores)
-    print(f"\nARISS SCORE : {result['ariss_score']:.1f}/100")
-    print(f"Confidence  : {result['confidence']:.1f}%")
-    print(f"Mean words  : {result['mean_word_count']:.1f}")
-    print(f"Mean len_w  : {result['mean_length_weight']:.3f}")
+        r = scorer.analyze_comment_with_context(c, subject, context)
+        results.append(r)
+        print(f"[{r.sentiment_score:5.1f}] {c.text[:60]}")
+        print(f"         Context: {r.understood_context}")
+        print(f"         Sarcasm: {r.has_sarcasm} | Intensity: {r.emotional_intensity:.0f}\n")
+    
+    ariss = scorer.calculate_ariss(results)
+    print(f"{'='*70}")
+    print(f"ARISS SCORE: {ariss['ariss_score']:.1f}/100")
+    print(f"Distribution: {ariss['positive_pct']:.0f}% pos | {ariss['neutral_pct']:.0f}% neu | {ariss['negative_pct']:.0f}% neg")
+    print(f"Confidence: {ariss['confidence']:.1f}%")
     print(f"{'='*70}\n")

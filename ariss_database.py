@@ -1,6 +1,8 @@
 """
 ARISS Database Module
 Stores and retrieves ARISS scores over time for trending analysis
+
+ARISS = Aggregate Real-time Internet Sentiment Score
 """
 
 import sqlite3
@@ -82,6 +84,8 @@ class ARISSDatabase:
                 claude_score REAL,
                 bias_score REAL,
                 source_credibility REAL,
+                length_weight REAL DEFAULT 1.0,
+                word_count INTEGER DEFAULT 0,
                 weighted_score REAL,
                 upvotes INTEGER,
                 author TEXT,
@@ -89,6 +93,29 @@ class ARISSDatabase:
                 FOREIGN KEY (subject_id) REFERENCES subjects(id)
             )
         """)
+
+        # Migrate existing databases: add new columns if absent
+        for col, definition in [
+            ("length_weight", "REAL DEFAULT 1.0"),
+            ("word_count",    "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                cursor.execute(
+                    f"ALTER TABLE sentiment_scores ADD COLUMN {col} {definition}"
+                )
+            except Exception:
+                pass  # Column already exists
+
+        for col, definition in [
+            ("mean_length_weight", "REAL"),
+            ("mean_word_count",    "REAL"),
+        ]:
+            try:
+                cursor.execute(
+                    f"ALTER TABLE ariss_scores ADD COLUMN {col} {definition}"
+                )
+            except Exception:
+                pass
         
         # Create indexes for faster queries
         cursor.execute("""
@@ -163,8 +190,9 @@ class ARISSDatabase:
             INSERT INTO ariss_scores (
                 subject_id, score, confidence, sample_size,
                 mean_bias, mean_credibility, variance, std_dev,
-                min_score, max_score, source_breakdown, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                min_score, max_score, source_breakdown, metadata,
+                mean_length_weight, mean_word_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             subject_id,
             ariss_data.get('ariss_score', 50.0),
@@ -177,7 +205,9 @@ class ARISSDatabase:
             ariss_data.get('min_score'),
             ariss_data.get('max_score'),
             source_breakdown,
-            metadata
+            metadata,
+            ariss_data.get('mean_length_weight'),
+            ariss_data.get('mean_word_count'),
         ))
         
         conn.commit()
@@ -206,9 +236,10 @@ class ARISSDatabase:
                     INSERT OR REPLACE INTO sentiment_scores (
                         subject_id, comment_id, text, source,
                         textblob_score, vader_score, claude_score,
-                        bias_score, source_credibility, weighted_score,
-                        upvotes, author, timestamp
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        bias_score, source_credibility,
+                        length_weight, word_count,
+                        weighted_score, upvotes, author, timestamp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     subject_id,
                     score.comment_id,
@@ -219,6 +250,8 @@ class ARISSDatabase:
                     score.claude_score,
                     score.bias_score,
                     score.source_credibility,
+                    getattr(score, 'length_weight', 1.0),
+                    getattr(score, 'word_count', 0),
                     score.weighted_score,
                     score.upvotes,
                     score.author,
@@ -420,6 +453,8 @@ class ARISSDatabase:
                 ss.claude_score,
                 ss.bias_score,
                 ss.source_credibility,
+                ss.length_weight,
+                ss.word_count,
                 ss.weighted_score,
                 ss.upvotes,
                 ss.timestamp

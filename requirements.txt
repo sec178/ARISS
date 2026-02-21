@@ -1,8 +1,11 @@
 # ARISS Requirements
 # Install with: pip install -r requirements.txt
+#
+# NOTE: If you encounter issues with anthropic package,
+# try: pip install anthropic --upgrade
 
 # Core dependencies
-anthropic>=0.18.0
+anthropic
 pandas>=2.0.0
 numpy>=1.24.0
 python-dotenv>=1.0.0

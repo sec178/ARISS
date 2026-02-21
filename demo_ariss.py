@@ -1,6 +1,8 @@
 """
 ARISS Quick Start Example
 Demonstrates basic usage without needing full API setup
+
+ARISS = Aggregate Real-time Internet Sentiment Score
 """
 
 import os
@@ -12,7 +14,7 @@ def demo_ariss():
     """Demonstrate ARISS functionality with sample data."""
     
     print("=" * 60)
-    print("ARISS - Aggregate Representative Internet Sentiment Score")
+    print("ARISS - Aggregate Real-time Internet Sentiment Score")
     print("Quick Start Demo")
     print("=" * 60)
     
